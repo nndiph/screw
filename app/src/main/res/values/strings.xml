@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">ScrewBot</string>
+    <string name="a11y_desc">Dipakai ScrewBot hanya untuk mengetuk dan menggeser layar game atas perintah kamu.</string>
+</resources>
