@@ -14,6 +14,7 @@ import android.text.InputType
 import android.view.Gravity
 import android.view.ViewGroup
 import android.widget.Button
+import android.widget.CheckBox
 import android.widget.EditText
 import android.widget.LinearLayout
 import android.widget.ScrollView
@@ -29,6 +30,7 @@ class MainActivity : Activity() {
     private lateinit var batchEt: EditText
     private lateinit var reserveEt: EditText
     private lateinit var delayEt: EditText
+    private lateinit var circlesCb: CheckBox
 
     private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
 
@@ -85,15 +87,19 @@ class MainActivity : Activity() {
         })
 
         col.addView(label("Pengaturan", 16f, true))
-        col.addView(label("Ketukan per pindai (1-4)", 12f))
-        batchEt = numberField("2", cfg.getInt("batch", 2))
+        col.addView(label("Ketukan per pindai (1-8)", 12f))
+        batchEt = numberField("6", cfg.getInt("batch2", 6))
         col.addView(batchEt)
         col.addView(label("Lubang penyangga yang disisakan (0-4)", 12f))
-        reserveEt = numberField("2", cfg.getInt("reserve", 2))
+        reserveEt = numberField("2", cfg.getInt("reserve2", 2))
         col.addView(reserveEt)
-        col.addView(label("Jeda setelah ketukan, milidetik (200-3000)", 12f))
-        delayEt = numberField("700", cfg.getInt("delay", 700))
+        col.addView(label("Jeda setelah ketukan, milidetik (100-3000). Makin kecil makin cepat.", 12f))
+        delayEt = numberField("350", cfg.getInt("delay2", 350))
         col.addView(delayEt)
+        circlesCb = CheckBox(this)
+        circlesCb.text = "Tampilkan lingkaran deteksi saat jalan (lebih lambat)"
+        circlesCb.isChecked = cfg.getBoolean("circles2", false)
+        col.addView(circlesCb)
 
         col.addView(label("3. Mulai", 16f, true))
         col.addView(label("Android akan meminta izin merekam layar. Setelah itu panel melayang muncul; buka game lalu tekan MULAI di panel.", 12f))
@@ -116,17 +122,32 @@ class MainActivity : Activity() {
         val overlay = Settings.canDrawOverlays(this)
         overlayStatus.text = if (overlay) "Aktif" else "Belum aktif"
         overlayStatus.setTextColor(if (overlay) Color.rgb(0, 130, 60) else Color.rgb(190, 40, 40))
-        val a11y = ClickService.instance != null
-        a11yStatus.text = if (a11y) "Aktif" else "Belum aktif (cari ScrewBot di daftar layanan terpasang)"
-        a11yStatus.setTextColor(if (a11y) Color.rgb(0, 130, 60) else Color.rgb(190, 40, 40))
+        refreshA11y()
+    }
+
+    private fun a11yState(): Int {
+        if (ClickService.instance != null) return 2
+        val enabled = Settings.Secure.getString(contentResolver, Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES) ?: ""
+        return if (enabled.contains(packageName, ignoreCase = true)) 1 else 0
+    }
+
+    private fun refreshA11y() {
+        val st = a11yState()
+        a11yStatus.text = when (st) {
+            2 -> "Aktif dan terhubung"
+            1 -> "Dinyalakan tapi belum tersambung. Matikan lalu nyalakan lagi ScrewBot di pengaturan aksesibilitas (di Xiaomi: izinkan Mulai otomatis dan Tanpa batasan baterai)."
+            else -> "Belum aktif (cari ScrewBot di daftar layanan terpasang)"
+        }
+        a11yStatus.setTextColor(if (st == 2) Color.rgb(0, 130, 60) else Color.rgb(190, 40, 40))
     }
 
     private fun saveCfg() {
         fun num(e: EditText, def: Int) = e.text.toString().toIntOrNull() ?: def
         getSharedPreferences("cfg", Context.MODE_PRIVATE).edit()
-            .putInt("batch", num(batchEt, 2).coerceIn(1, 4))
-            .putInt("reserve", num(reserveEt, 2).coerceIn(0, 4))
-            .putInt("delay", num(delayEt, 700).coerceIn(200, 3000))
+            .putInt("batch2", num(batchEt, 6).coerceIn(1, 8))
+            .putInt("reserve2", num(reserveEt, 2).coerceIn(0, 4))
+            .putInt("delay2", num(delayEt, 350).coerceIn(100, 3000))
+            .putBoolean("circles2", circlesCb.isChecked)
             .apply()
     }
 
@@ -135,8 +156,15 @@ class MainActivity : Activity() {
             Toast.makeText(this, "Aktifkan langkah 1 dulu", Toast.LENGTH_LONG).show()
             return
         }
-        if (ClickService.instance == null) {
-            Toast.makeText(this, "Aktifkan langkah 2 dulu", Toast.LENGTH_LONG).show()
+        refreshA11y()
+        val st = a11yState()
+        if (st != 2) {
+            Toast.makeText(
+                this,
+                if (st == 1) "Aksesibilitas dinyalakan tapi belum tersambung: matikan lalu nyalakan lagi ScrewBot"
+                else "Aktifkan layanan aksesibilitas ScrewBot dulu (langkah 2)",
+                Toast.LENGTH_LONG,
+            ).show()
             return
         }
         saveCfg()

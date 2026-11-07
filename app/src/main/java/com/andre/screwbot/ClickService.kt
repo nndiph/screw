@@ -37,20 +37,36 @@ class ClickService : AccessibilityService() {
     fun tap(x: Int, y: Int): Boolean {
         val p = Path()
         p.moveTo(x.toFloat(), y.toFloat())
-        return gesture(p, 50)
+        return dispatch(GestureDescription.Builder().addStroke(GestureDescription.StrokeDescription(p, 0, 50)).build(), 2000)
     }
 
-    fun swipe(x1: Int, y1: Int, x2: Int, y2: Int, ms: Long = 350): Boolean {
+    /**
+     * Banyak ketukan berurutan dalam satu gestur (jauh lebih cepat daripada satu per satu).
+     * Tiap ketukan dimulai [spacingMs] setelah sebelumnya dan berlangsung [tapMs].
+     */
+    fun tapMany(points: List<Pair<Int, Int>>, spacingMs: Long = 90, tapMs: Long = 40): Boolean {
+        var ok = true
+        val chunk = GestureDescription.getMaxStrokeCount()
+        for (part in points.chunked(chunk)) {
+            val b = GestureDescription.Builder()
+            for ((i, pt) in part.withIndex()) {
+                val p = Path()
+                p.moveTo(pt.first.toFloat(), pt.second.toFloat())
+                b.addStroke(GestureDescription.StrokeDescription(p, i * spacingMs, tapMs))
+            }
+            ok = dispatch(b.build(), part.size * spacingMs + tapMs + 2000) && ok
+        }
+        return ok
+    }
+
+    fun swipe(x1: Int, y1: Int, x2: Int, y2: Int, ms: Long = 250): Boolean {
         val p = Path()
         p.moveTo(x1.toFloat(), y1.toFloat())
         p.lineTo(x2.toFloat(), y2.toFloat())
-        return gesture(p, ms)
+        return dispatch(GestureDescription.Builder().addStroke(GestureDescription.StrokeDescription(p, 0, ms)).build(), ms + 2000)
     }
 
-    private fun gesture(path: Path, durationMs: Long): Boolean {
-        val g = GestureDescription.Builder()
-            .addStroke(GestureDescription.StrokeDescription(path, 0, durationMs))
-            .build()
+    private fun dispatch(g: GestureDescription, timeoutMs: Long): Boolean {
         val latch = CountDownLatch(1)
         var ok = false
         val cb = object : GestureResultCallback() {
@@ -64,7 +80,7 @@ class ClickService : AccessibilityService() {
             }
         }
         if (!dispatchGesture(g, cb, null)) return false
-        latch.await(2, TimeUnit.SECONDS)
+        latch.await(timeoutMs, TimeUnit.MILLISECONDS)
         return ok
     }
 }

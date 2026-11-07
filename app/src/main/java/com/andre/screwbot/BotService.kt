@@ -94,7 +94,7 @@ class BotService : Service() {
         private const val TAG = "ScrewBot"
     }
 
-    private class Cfg(val batch: Int, val reserve: Int, val delay: Long, val tapGap: Long, val patience: Int)
+    private class Cfg(val batch: Int, val reserve: Int, val delay: Long, val circles: Boolean, val patience: Int)
 
     private val ui = Handler(Looper.getMainLooper())
     private lateinit var wm: WindowManager
@@ -118,6 +118,12 @@ class BotService : Service() {
     @Volatile private var scanReq = false
     private var idle = 0
     private val blacklist = ArrayList<Pair<Int, Int>>()
+    private val pending = ArrayList<Pair<Long, String>>()   // ketukan yang masih "terbang" ke kotak: (waktu, warna)
+    private var lastPicks: List<Screw> = emptyList()
+    private val fails = HashMap<Pair<Int, Int>, Int>()
+    private var noMatchRot = 0
+    private var rotIndex = 0
+    private var fullWaits = 0
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -311,8 +317,7 @@ class BotService : Service() {
                 if (ClickService.instance == null) {
                     status("Aktifkan layanan aksesibilitas ScrewBot dulu")
                 } else {
-                    idle = 0
-                    blacklist.clear()
+                    resetRun()
                     botOn = true
                     start.text = "JEDA"
                     status("Berjalan...")
@@ -394,11 +399,11 @@ class BotService : Service() {
     private fun cfg(): Cfg {
         val p = getSharedPreferences("cfg", Context.MODE_PRIVATE)
         return Cfg(
-            batch = p.getInt("batch", 2).coerceIn(1, 4),
-            reserve = p.getInt("reserve", 2).coerceIn(0, 4),
-            delay = p.getInt("delay", 700).coerceIn(200, 3000).toLong(),
-            tapGap = 250,
-            patience = 6,
+            batch = p.getInt("batch2", 6).coerceIn(1, 8),
+            reserve = p.getInt("reserve2", 2).coerceIn(0, 4),
+            delay = p.getInt("delay2", 350).coerceIn(100, 3000).toLong(),
+            circles = p.getBoolean("circles2", false),
+            patience = 8,
         )
     }
 
@@ -423,6 +428,17 @@ class BotService : Service() {
         }
     }
 
+    private fun resetRun() {
+        idle = 0
+        noMatchRot = 0
+        rotIndex = 0
+        fullWaits = 0
+        blacklist.clear()
+        fails.clear()
+        pending.clear()
+        lastPicks = emptyList()
+    }
+
     private fun doScan() {
         clearDebugAndWait()
         val bgr = grab()
@@ -431,13 +447,17 @@ class BotService : Service() {
             return
         }
         try {
+            val t0 = System.currentTimeMillis()
             val hsv = ScrewDetector.hsvOf(bgr)
             val screws = ScrewDetector.detect(bgr, hsv, extraExclude())
+            val ms = System.currentTimeMillis() - t0
+            val boxes = Hud.readBoxes(hsv)
             val counts = screws.groupingBy { it.color }.eachCount().entries.joinToString(" ") { "${it.key.take(3)}${it.value}" }
             ui.post { debug?.set(screws, emptyList()) }
             ui.postDelayed({ debug?.clear() }, 3000)
             val tag = if (Hud.inGame(hsv)) "" else " (bukan layar game?)"
-            status("Pindai: ${screws.size} baut $counts$tag")
+            val bx = boxes.joinToString("/") { "${it.color}${it.free}" }
+            status("Pindai ${ms}ms: ${screws.size} baut $counts | kotak $bx$tag")
         } finally {
             bgr.release()
         }
@@ -448,6 +468,39 @@ class BotService : Service() {
         return if (r == null) emptyList() else listOf(r)
     }
 
+    private fun sq(v: Int): Long = v.toLong() * v
+
+    /** Baut yang sudah diketuk tapi masih terlihat di tempat yang sama dua kali berturut-turut = tidak bisa dilepas. */
+    private fun updateFails(now: List<Screw>) {
+        for (p in lastPicks) {
+            val still = now.any { it.color == p.color && sq(it.x - p.x) + sq(it.y - p.y) < 900L }
+            val key = Pair(p.x / 10, p.y / 10)
+            if (still) {
+                val n = (fails[key] ?: 0) + 1
+                fails[key] = n
+                if (n >= 2) blacklist.add(Pair(p.x, p.y))
+            } else {
+                fails.remove(key)
+            }
+        }
+        lastPicks = emptyList()
+    }
+
+    /** Putar objek: geser horizontal; tiap keempat kali geser vertikal bergantian agar atas/bawah terlihat. */
+    private fun rotate(click: ClickService) {
+        val i = rotIndex++
+        if (i % 4 == 3) {
+            val up = (i / 4) % 2 == 0
+            val y1 = (if (up) 0.64 else 0.44) * capH
+            val y2 = (if (up) 0.44 else 0.64) * capH
+            click.swipe((0.5 * capW).toInt(), y1.toInt(), (0.5 * capW).toInt(), y2.toInt())
+        } else {
+            click.swipe((0.25 * capW).toInt(), (0.57 * capH).toInt(), (0.75 * capW).toInt(), (0.57 * capH).toInt())
+        }
+        blacklist.clear()
+        fails.clear()
+    }
+
     private fun cycle() {
         val c = cfg()
         val click = ClickService.instance
@@ -455,10 +508,11 @@ class BotService : Service() {
             stopBot("Aksesibilitas mati. Aktifkan lagi.")
             return
         }
-        clearDebugAndWait()
+        if (c.circles) clearDebugAndWait()
+        val t0 = System.currentTimeMillis()
         val bgr = grab()
         if (bgr == null) {
-            Thread.sleep(200)
+            Thread.sleep(150)
             return
         }
         try {
@@ -476,36 +530,45 @@ class BotService : Service() {
             val boxes = Hud.readBoxes(hsv)
             val free = Hud.freeHoles(hsv)
             val screws = ScrewDetector.detect(bgr, hsv, extraExclude())
-            val (picks, why) = Strategy.chooseTargets(screws, boxes, free, c.reserve, c.batch, blacklist, 60)
-            ui.post { debug?.set(screws, picks) }
-            status("${screws.size} baut | $why | kotak ${boxes.filterNotNull().joinToString("/")}")
+            updateFails(screws)
+            val now = System.currentTimeMillis()
+            pending.removeAll { now - it.first > 900 }
+            val pend = pending.groupingBy { it.second }.eachCount()
+            val (picks, why) = Strategy.chooseTargets(
+                screws, boxes, free, c.reserve, c.batch, blacklist, 60, pend, noMatchRot >= 4,
+            )
+            val ms = System.currentTimeMillis() - t0
+            if (c.circles) ui.post { debug?.set(screws, picks) }
+            val bx = boxes.joinToString("/") { "${it.color}${it.free}" }
+            status("${screws.size} baut | $why | ${ms}ms | kotak $bx | sisa penyangga $free")
 
             if (picks.isEmpty()) {
+                if (why == "kotak penuh") {
+                    // kotak sedang terisi/berganti: tunggu sebentar, jangan putar objek
+                    fullWaits++
+                    if (fullWaits >= 20) stopBot("Berhenti: kotak tidak terbaca atau tidak berubah")
+                    else Thread.sleep(300)
+                    return
+                }
                 idle++
-                if (idle >= c.patience) {
+                noMatchRot++
+                if (idle >= c.patience + 2) {
                     stopBot("Berhenti: tidak ada baut yang bisa diketuk")
                     return
                 }
-                status("Memutar objek ($idle/${c.patience})")
-                click.swipe((0.30 * capW).toInt(), (0.57 * capH).toInt(), (0.70 * capW).toInt(), (0.57 * capH).toInt())
-                blacklist.clear()
-                Thread.sleep(c.delay)
+                status("Tidak ada yang cocok, memutar objek ($noMatchRot)")
+                rotate(click)
+                Thread.sleep(c.delay + 150)
                 return
             }
             idle = 0
-            for (s in picks) {
-                click.tap(s.x, s.y)
-                Thread.sleep(c.tapGap)
-            }
+            fullWaits = 0
+            noMatchRot = 0
+            lastPicks = picks
+            val t = System.currentTimeMillis()
+            for (s in picks) pending.add(Pair(t, s.color))
+            click.tapMany(picks.map { Pair(it.x, it.y) })
             Thread.sleep(c.delay)
-            clearDebugAndWait()
-            val after = grab()
-            if (after != null) {
-                for (s in picks) {
-                    if (!ScrewDetector.regionChanged(bgr, after, s.x, s.y)) blacklist.add(Pair(s.x, s.y))
-                }
-                after.release()
-            }
         } finally {
             bgr.release()
         }

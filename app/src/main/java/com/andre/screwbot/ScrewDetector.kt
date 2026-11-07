@@ -24,11 +24,12 @@ object ScrewDetector {
     private val ROI = doubleArrayOf(0.0, 0.31, 1.0, 0.83)
     private val EXCLUDE = arrayOf(
         doubleArrayOf(0.0, 0.72, 0.11, 0.83),   // slider zoom
-        doubleArrayOf(0.93, 0.35, 1.0, 0.44),   // tombol melayang kanan
+        doubleArrayOf(0.93, 0.0, 1.0, 1.0),     // tepi kanan: tombol melayang sistem/ScrewBot
     )
     private val ANGLES = intArrayOf(0, 15, 30, 45)
     private val SCALES = doubleArrayOf(0.8, 1.0, 1.25)
     private const val REF_W = 1159.0
+    private const val CAMO_SCORE = 9.5   // baut sewarna sekelilingnya perlu tanda '+' lebih kuat
     private const val PROC_SCALE = 0.7
     private const val HOUGH_P2 = 13.0 * 0.6   // PROC_SCALE < 0.8
 
@@ -172,6 +173,28 @@ object ScrewDetector {
         return Triple(Colors.classify(h, s, v), cx + bestDx, cy + bestDy)
     }
 
+    /** True bila warna di sekeliling baut hampir sama dengan badan baut (baut berkamuflase). */
+    private fun surroundSimilar(img: HsvImage, cx: Int, cy: Int, r: Int, h0: Double, s0: Double, v0: Double): Boolean {
+        val pts = ArrayList<IntArray>()
+        for (rf in doubleArrayOf(1.5, 1.8)) {
+            for (i in 0 until 16) {
+                val ang = i * 2.0 * Math.PI / 16
+                val px = (cx + cos(ang) * r * rf).toInt()
+                val py = (cy + sin(ang) * r * rf).toInt()
+                if (px in 0 until img.w && py in 0 until img.h) pts.add(img.at(px, py))
+            }
+        }
+        if (pts.size < 16) return false
+        val hh = DoubleArray(pts.size) { val h = pts[it][0].toDouble(); if (h >= 165) h - 180 else h }
+        var sh = median(hh) % 180
+        if (sh < 0) sh += 180
+        var dh = abs(sh - h0)
+        dh = min(dh, 180 - dh)
+        val sv = median(DoubleArray(pts.size) { pts[it][2].toDouble() })
+        val ss = median(DoubleArray(pts.size) { pts[it][1].toDouble() })
+        return dh <= 7 && abs(sv - v0) <= 30 && abs(ss - s0) <= 60
+    }
+
     // ------------------------------------------------------------------ deteksi
     /**
      * @param bgr gambar layar penuh (BGR)
@@ -250,10 +273,26 @@ object ScrewDetector {
             if (EXCLUDE.any { cx >= it[0] * W && cx <= it[2] * W && cy >= it[1] * H && cy <= it[3] * H }) continue
             if (extraExclude.any { cx >= it[0] && cx <= it[2] && cy >= it[1] && cy <= it[3] }) continue
             val (color, fx, fy) = bodyColor(hsv, cx, cy, r)
+            val rg = ring(hsv, fx, fy, r)
+            if (rg.size >= 16) {
+                val hh = DoubleArray(rg.size) { val h = rg[it][0].toDouble(); if (h >= 165) h - 180 else h }
+                var ch = median(hh) % 180
+                if (ch < 0) ch += 180
+                val cs = median(DoubleArray(rg.size) { rg[it][1].toDouble() })
+                val cv = median(DoubleArray(rg.size) { rg[it][2].toDouble() })
+                if (c.score < CAMO_SCORE && surroundSimilar(hsv, fx, fy, r, ch, cs, cv)) continue
+            }
             if (color in Colors.SCREW) out.add(Screw(fx, fy, c.score, color, r))
         }
         small.release(); roi.release(); pm.release(); gray.release(); circles.release(); dil.release()
-        return out
+
+        // buang duplikat yang muncul setelah pusat digeser (skor tertinggi menang)
+        val fullBase = W / REF_W
+        val finalList = ArrayList<Screw>()
+        for (s in out.sortedByDescending { it.score }) {
+            if (finalList.all { sq(s.x - it.x) + sq(s.y - it.y) > (28 * fullBase) * (28 * fullBase) }) finalList.add(s)
+        }
+        return finalList
     }
 
     private fun sq(v: Int): Double = v.toDouble() * v
