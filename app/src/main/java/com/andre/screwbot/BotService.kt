@@ -94,7 +94,7 @@ class BotService : Service() {
         private const val TAG = "ScrewBot"
     }
 
-    private class Cfg(val batch: Int, val reserve: Int, val delay: Long, val circles: Boolean, val patience: Int)
+    private class Cfg(val batch: Int, val reserve: Int, val delay: Long, val circles: Boolean, val fill: Boolean, val patience: Int)
 
     private val ui = Handler(Looper.getMainLooper())
     private lateinit var wm: WindowManager
@@ -124,6 +124,13 @@ class BotService : Service() {
     private var noMatchRot = 0
     private var rotIndex = 0
     private var fullWaits = 0
+    private val bad = ArrayList<Screw>()                // contoh baut yang ternyata masuk penyangga (salah baca warna)
+    private var lastTap: List<Screw> = emptyList()      // ketukan terakhir yang hasilnya belum diperiksa
+    private var lastTapFill = false
+    private var prevFree = -1
+    private var prevBoxSum = 0
+    private var cautious = 0                            // >0: ketuk satu-satu agar penyebab salah masuk jelas
+    private var unexpected = 0                          // jumlah baut yang salah masuk penyangga
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -403,6 +410,7 @@ class BotService : Service() {
             reserve = p.getInt("reserve2", 2).coerceIn(0, 4),
             delay = p.getInt("delay2", 350).coerceIn(100, 3000).toLong(),
             circles = p.getBoolean("circles2", false),
+            fill = p.getBoolean("fill2", false),
             patience = 8,
         )
     }
@@ -437,6 +445,12 @@ class BotService : Service() {
         fails.clear()
         pending.clear()
         lastPicks = emptyList()
+        bad.clear()
+        lastTap = emptyList()
+        lastTapFill = false
+        prevFree = -1
+        cautious = 0
+        unexpected = 0
     }
 
     private fun doScan() {
@@ -529,13 +543,30 @@ class BotService : Service() {
             }
             val boxes = Hud.readBoxes(hsv)
             val free = Hud.freeHoles(hsv)
-            val screws = ScrewDetector.detect(bgr, hsv, extraExclude())
+            val boxSum = boxes.sumOf { it.free }
+            if (lastTap.isNotEmpty() && prevFree >= 0 && !lastTapFill) {
+                val drop = prevFree - free
+                if (drop > 0) {
+                    // ada baut masuk penyangga padahal seharusnya ke kotak: warnanya salah baca
+                    unexpected += drop
+                    if (lastTap.size == 1) bad.add(lastTap[0]) else cautious = 8
+                } else if (cautious > 0 && prevBoxSum - boxSum > 0) {
+                    cautious--
+                }
+            }
+            lastTap = emptyList()
+            if (unexpected >= 3) {
+                stopBot("Berhenti: $unexpected baut salah masuk penyangga (warna salah baca). Cek warna kotak.")
+                return
+            }
+            val screws = ScrewDetector.detect(bgr, hsv, extraExclude()).filter { !Strategy.looksBad(it, bad) }
             updateFails(screws)
             val now = System.currentTimeMillis()
             pending.removeAll { now - it.first > 900 }
             val pend = pending.groupingBy { it.second }.eachCount()
             val (picks, why) = Strategy.chooseTargets(
-                screws, boxes, free, c.reserve, c.batch, blacklist, 60, pend, noMatchRot >= 4,
+                screws, boxes, free, c.reserve, if (cautious > 0) 1 else c.batch, blacklist, 60, pend,
+                c.fill && noMatchRot >= 12,
             )
             val ms = System.currentTimeMillis() - t0
             if (c.circles) ui.post { debug?.set(screws, picks) }
@@ -565,10 +596,14 @@ class BotService : Service() {
             fullWaits = 0
             noMatchRot = 0
             lastPicks = picks
+            lastTap = picks
+            lastTapFill = why == "isi penyangga"
+            prevFree = free
+            prevBoxSum = boxSum
             val t = System.currentTimeMillis()
             for (s in picks) pending.add(Pair(t, s.color))
             click.tapMany(picks.map { Pair(it.x, it.y) })
-            Thread.sleep(c.delay)
+            Thread.sleep(if (cautious > 0) maxOf(c.delay, 900L) else c.delay)
         } finally {
             bgr.release()
         }

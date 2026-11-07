@@ -1,11 +1,12 @@
 package com.andre.screwbot
 
+import kotlin.math.abs
 import kotlin.math.max
 
 // Logika murni (tanpa Android/OpenCV): warna, pembacaan HUD, dan pemilihan target.
 // Port 1:1 dari referensi Python (screwdetect.py + bot.py).
 
-data class Screw(val x: Int, val y: Int, val score: Double, val color: String, val r: Int)
+data class Screw(val x: Int, val y: Int, val score: Double, val color: String, val r: Int, val h: Int = 0, val s: Int = 0, val v: Int = 0)
 
 /** Kotak penampung yang sudah terbuka: warna dan jumlah lubang yang masih kosong. */
 data class Box(val color: String, val free: Int)
@@ -24,13 +25,13 @@ object Colors {
 
     fun classify(h: Double, s: Double, v: Double): String {
         if (s < 45) return if (v > 170) "putih" else "?"
-        if (v < 175 && h >= 4 && h <= 24 && s > 90) return "coklat"
+        if (v < 175 && (h >= 4 && h <= 24 || h > 24 && h <= 28 && s < 150)) return "coklat"   // coklat bisa pucat/zaitun
         if (h < 7 || h >= 168) return "merah"
         if (h < 19) return "oranye"
         if (h < 36) return "kuning"
         if (h < 85) return "hijau"
         if (h < 99) return "toska"
-        if (h < 123) return "biru"
+        if (h < 120 || h < 123 && s >= 150) return "biru"
         if (h < 143) return "ungu"
         return "pink"
     }
@@ -81,6 +82,11 @@ object Hud {
 }
 
 object Strategy {
+    /** Apakah baut ini mirip (warna sama, H/S/V berdekatan) dengan contoh yang pernah salah masuk penyangga? */
+    fun looksBad(s: Screw, bad: List<Screw>): Boolean = bad.any {
+        it.color == s.color && abs(it.h - s.h) <= 4 && abs(it.s - s.s) <= 30 && abs(it.v - s.v) <= 40
+    }
+
     private fun sq(v: Int) = v.toLong() * v
 
     /**

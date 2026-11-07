@@ -75,8 +75,7 @@ object ScrewDetector {
     }
 
     /** Peta respons '+' pada gambar proses (BGR, sudah diperkecil). */
-    private fun plusResponse(small: Mat): Mat {
-        val base = small.cols() / REF_W
+    private fun plusResponse(small: Mat, base: Double): Mat {
         val lab = Mat()
         Imgproc.cvtColor(small, lab, Imgproc.COLOR_BGR2Lab)
         val l = Mat()
@@ -201,6 +200,15 @@ object ScrewDetector {
      * @param extraExclude persegi [x0,y0,x1,y1] dalam piksel yang tidak boleh berisi baut (mis. panel melayang)
      */
     fun detect(bgr: Mat, hsv: HsvImage, extraExclude: List<IntArray>, minScore: Double = 6.5): List<Screw> {
+        val final = detectZoom(bgr, hsv, extraExclude, minScore, 1.0).toMutableList()   // ukuran acuan = hasil utama
+        // objek yang lebih besar (baut ~1.75x) hanya menambah baut yang belum tercakup
+        for (s in detectZoom(bgr, hsv, extraExclude, minScore, 1.75)) {
+            if (final.all { sq(s.x - it.x) + sq(s.y - it.y) > 0.36 * s.r * s.r }) final.add(s)
+        }
+        return final
+    }
+
+    private fun detectZoom(bgr: Mat, hsv: HsvImage, extraExclude: List<IntArray>, minScore: Double, z: Double): List<Screw> {
         val W = bgr.cols()
         val H = bgr.rows()
         val x0 = (ROI[0] * W).toInt()
@@ -210,10 +218,11 @@ object ScrewDetector {
 
         val roi = Mat(bgr, Rect(x0, y0, x1 - x0, y1 - y0))
         val small = Mat()
-        Imgproc.resize(roi, small, Size(), PROC_SCALE, PROC_SCALE, Imgproc.INTER_AREA)
-        val base = small.cols() / REF_W
+        val pe = PROC_SCALE / z                      // skala proses efektif
+        Imgproc.resize(roi, small, Size(), pe, pe, Imgproc.INTER_AREA)
+        val base = small.cols() / REF_W * z          // skala templat terhadap gambar proses
 
-        val pm = plusResponse(small)
+        val pm = plusResponse(small, base)
         val pw = pm.cols()
         val ph = pm.rows()
         val pmArr = FloatArray(pw * ph)
@@ -267,27 +276,29 @@ object ScrewDetector {
 
         val out = ArrayList<Screw>()
         for (c in kept) {
-            val cx = (c.cx / PROC_SCALE).toInt() + x0
-            val cy = (c.cy / PROC_SCALE).toInt() + y0
-            val r = max(8, (c.r / PROC_SCALE).toInt())
+            val cx = (c.cx / pe).toInt() + x0
+            val cy = (c.cy / pe).toInt() + y0
+            val r = max(8, (c.r / pe).toInt())
             if (EXCLUDE.any { cx >= it[0] * W && cx <= it[2] * W && cy >= it[1] * H && cy <= it[3] * H }) continue
             if (extraExclude.any { cx >= it[0] && cx <= it[2] && cy >= it[1] && cy <= it[3] }) continue
             val (color, fx, fy) = bodyColor(hsv, cx, cy, r)
             val rg = ring(hsv, fx, fy, r)
+            var mh = 0; var ms = 0; var mv = 0
             if (rg.size >= 16) {
                 val hh = DoubleArray(rg.size) { val h = rg[it][0].toDouble(); if (h >= 165) h - 180 else h }
                 var ch = median(hh) % 180
                 if (ch < 0) ch += 180
                 val cs = median(DoubleArray(rg.size) { rg[it][1].toDouble() })
                 val cv = median(DoubleArray(rg.size) { rg[it][2].toDouble() })
+                mh = ch.toInt(); ms = cs.toInt(); mv = cv.toInt()
                 if (c.score < CAMO_SCORE && surroundSimilar(hsv, fx, fy, r, ch, cs, cv)) continue
             }
-            if (color in Colors.SCREW) out.add(Screw(fx, fy, c.score, color, r))
+            if (color in Colors.SCREW) out.add(Screw(fx, fy, c.score, color, r, mh, ms, mv))
         }
         small.release(); roi.release(); pm.release(); gray.release(); circles.release(); dil.release()
 
         // buang duplikat yang muncul setelah pusat digeser (skor tertinggi menang)
-        val fullBase = W / REF_W
+        val fullBase = W / REF_W * z
         val finalList = ArrayList<Screw>()
         for (s in out.sortedByDescending { it.score }) {
             if (finalList.all { sq(s.x - it.x) + sq(s.y - it.y) > (28 * fullBase) * (28 * fullBase) }) finalList.add(s)

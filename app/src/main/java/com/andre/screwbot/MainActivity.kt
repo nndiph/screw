@@ -31,6 +31,7 @@ class MainActivity : Activity() {
     private lateinit var reserveEt: EditText
     private lateinit var delayEt: EditText
     private lateinit var circlesCb: CheckBox
+    private lateinit var fillCb: CheckBox
 
     private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
 
@@ -100,6 +101,10 @@ class MainActivity : Activity() {
         circlesCb.text = "Tampilkan lingkaran deteksi saat jalan (lebih lambat)"
         circlesCb.isChecked = cfg.getBoolean("circles2", false)
         col.addView(circlesCb)
+        fillCb = CheckBox(this)
+        fillCb.text = "Boleh isi penyangga bila buntu (tidak disarankan)"
+        fillCb.isChecked = cfg.getBoolean("fill2", false)
+        col.addView(fillCb)
 
         col.addView(label("3. Mulai", 16f, true))
         col.addView(label("Android akan meminta izin merekam layar. Setelah itu panel melayang muncul; buka game lalu tekan MULAI di panel.", 12f))
@@ -148,6 +153,7 @@ class MainActivity : Activity() {
             .putInt("reserve2", num(reserveEt, 2).coerceIn(0, 4))
             .putInt("delay2", num(delayEt, 350).coerceIn(100, 3000))
             .putBoolean("circles2", circlesCb.isChecked)
+            .putBoolean("fill2", fillCb.isChecked)
             .apply()
     }
 
