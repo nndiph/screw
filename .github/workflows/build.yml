@@ -3,6 +3,8 @@ on:
   push:
     branches: [main, master]
   workflow_dispatch:
+permissions:
+  contents: write
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -21,3 +23,11 @@ jobs:
         with:
           name: screwbot-debug-apk
           path: app/build/outputs/apk/debug/app-debug.apk
+      - name: Terbitkan APK sebagai Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cp app/build/outputs/apk/debug/app-debug.apk ScrewBot.apk
+          gh release create "v${{ github.run_number }}" ScrewBot.apk \
+            --title "ScrewBot build ${{ github.run_number }}" \
+            --notes "APK debug. Unduh ScrewBot.apk lalu pasang di HP."
