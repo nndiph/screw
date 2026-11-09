@@ -17,8 +17,9 @@ import kotlin.math.sin
 import kotlin.math.sqrt
 
 /**
- * Detektor baut. Port dari screwdetect.py (referensi Python yang sudah diuji pada screenshot).
- * Kandidat dari HoughCircles + puncak respons filter '+', skor = kekuatan tanda '+'.
+ * Detektor baut. Port dari screwml.py (referensi Python yang diuji pada screenshot berlabel).
+ * 1) kandidat longgar: HoughCircles + puncak respons filter '+' pada dua ukuran baut;
+ * 2) tiap kandidat dinilai classifier (ScrewML.prob); 3) warna diambil dari dalam kepala baut.
  */
 object ScrewDetector {
     private val ROI = doubleArrayOf(0.0, 0.31, 1.0, 0.83)
@@ -29,11 +30,10 @@ object ScrewDetector {
     private val ANGLES = intArrayOf(0, 15, 30, 45)
     private val SCALES = doubleArrayOf(0.8, 1.0, 1.25)
     private const val REF_W = 1159.0
-    private const val CAMO_SCORE = 9.5   // baut sewarna sekelilingnya perlu tanda '+' lebih kuat
     private const val PROC_SCALE = 0.7
     private const val HOUGH_P2 = 13.0 * 0.6   // PROC_SCALE < 0.8
 
-    private class Cand(val fromHough: Int, val score: Double, val cx: Int, val cy: Int, val r: Int)
+    private class Cand(val score: Double, val x: Int, val y: Int, val r: Int)
 
     private fun rnd(v: Double): Int = floor(v + 0.5).toInt()
 
@@ -117,210 +117,114 @@ object ScrewDetector {
         return res
     }
 
-    // ------------------------------------------------------------------ warna
-    private fun median(v: DoubleArray): Double {
-        val s = v.sortedArray()
-        val n = s.size
-        return if (n % 2 == 1) s[n / 2] else (s[n / 2 - 1] + s[n / 2]) / 2.0
-    }
-
-    private fun std(v: DoubleArray): Double {
-        val m = v.average()
-        var acc = 0.0
-        for (x in v) acc += (x - m) * (x - m)
-        return sqrt(acc / v.size)
-    }
-
-    /** Cincin badan baut: baris [h, s, v]; kosong bila terlalu sedikit titik valid. */
-    private fun ring(img: HsvImage, cx: Int, cy: Int, r: Int): List<IntArray> {
-        val pts = ArrayList<IntArray>()
-        for (rf in doubleArrayOf(0.45, 0.6)) {
-            for (i in 0 until 16) {
-                val ang = i * 2.0 * Math.PI / 16 + Math.PI / 8
-                val px = (cx + cos(ang) * r * rf).toInt()
-                val py = (cy + sin(ang) * r * rf * 0.85).toInt()
-                if (px in 0 until img.w && py in 0 until img.h) pts.add(img.at(px, py))
-            }
-        }
-        return pts
-    }
-
-    /** Geser pusat (+-2 langkah) ke posisi dengan cincin paling seragam, lalu baca warnanya. */
-    private fun bodyColor(img: HsvImage, cx: Int, cy: Int, r: Int): Triple<String, Int, Int> {
-        var bestCost = Double.MAX_VALUE
-        var bestDx = 0
-        var bestDy = 0
-        var bestPts: List<IntArray>? = null
-        val step = max(3, (r * 0.25).toInt())
-        for (iy in -2..2) for (ix in -2..2) {
-            val dy = iy * step
-            val dx = ix * step
-            val a = ring(img, cx + dx, cy + dy, r)
-            if (a.size < 16) continue
-            val hh = DoubleArray(a.size) { val h = a[it][0].toDouble(); if (h >= 165) h - 180 else h }
-            val vv = DoubleArray(a.size) { a[it][2].toDouble() }
-            val ss = DoubleArray(a.size) { a[it][1].toDouble() }
-            val cost = std(hh) * 3 + std(vv) * 0.5 - median(ss) * 0.05 + (abs(dx) + abs(dy)) * 0.3
-            if (cost < bestCost) { bestCost = cost; bestDx = dx; bestDy = dy; bestPts = a }
-        }
-        val a = bestPts ?: return Triple("?", cx, cy)
-        val hh = DoubleArray(a.size) { val h = a[it][0].toDouble(); if (h >= 165) h - 180 else h }
-        var h = median(hh) % 180
-        if (h < 0) h += 180
-        val s = median(DoubleArray(a.size) { a[it][1].toDouble() })
-        val v = median(DoubleArray(a.size) { a[it][2].toDouble() })
-        return Triple(Colors.classify(h, s, v), cx + bestDx, cy + bestDy)
-    }
-
-    /** True bila warna di sekeliling baut hampir sama dengan badan baut (baut berkamuflase). */
-    private fun surroundSimilar(img: HsvImage, cx: Int, cy: Int, r: Int, h0: Double, s0: Double, v0: Double): Boolean {
-        val pts = ArrayList<IntArray>()
-        for (rf in doubleArrayOf(1.5, 1.8)) {
-            for (i in 0 until 16) {
-                val ang = i * 2.0 * Math.PI / 16
-                val px = (cx + cos(ang) * r * rf).toInt()
-                val py = (cy + sin(ang) * r * rf).toInt()
-                if (px in 0 until img.w && py in 0 until img.h) pts.add(img.at(px, py))
-            }
-        }
-        if (pts.size < 16) return false
-        val hh = DoubleArray(pts.size) { val h = pts[it][0].toDouble(); if (h >= 165) h - 180 else h }
-        var sh = median(hh) % 180
-        if (sh < 0) sh += 180
-        var dh = abs(sh - h0)
-        dh = min(dh, 180 - dh)
-        val sv = median(DoubleArray(pts.size) { pts[it][2].toDouble() })
-        val ss = median(DoubleArray(pts.size) { pts[it][1].toDouble() })
-        return dh <= 7 && abs(sv - v0) <= 30 && abs(ss - s0) <= 60
-    }
-
-    // ------------------------------------------------------------------ deteksi
-    /**
-     * @param bgr gambar layar penuh (BGR)
-     * @param extraExclude persegi [x0,y0,x1,y1] dalam piksel yang tidak boleh berisi baut (mis. panel melayang)
-     */
-    fun detect(bgr: Mat, hsv: HsvImage, extraExclude: List<IntArray>, minScore: Double = 6.5): List<Screw> {
-        val final = detectZoom(bgr, hsv, extraExclude, minScore, 1.0).toMutableList()   // ukuran acuan = hasil utama
-        // objek yang lebih besar (baut ~1.75x) hanya menambah baut yang belum tercakup
-        for (s in detectZoom(bgr, hsv, extraExclude, minScore, 1.75)) {
-            if (final.all { sq(s.x - it.x) + sq(s.y - it.y) > 0.36 * s.r * s.r }) final.add(s)
-        }
-        return final
-    }
-
-    private fun detectZoom(bgr: Mat, hsv: HsvImage, extraExclude: List<IntArray>, minScore: Double, z: Double): List<Screw> {
+    // ------------------------------------------------------------------ kandidat
+    private fun rawCands(bgr: Mat, minScore: Double = 5.0): List<Cand> {
         val W = bgr.cols()
         val H = bgr.rows()
         val x0 = (ROI[0] * W).toInt()
         val y0 = (ROI[1] * H).toInt()
         val x1 = (ROI[2] * W).toInt()
         val y1 = (ROI[3] * H).toInt()
+        val roi = bgr.submat(Rect(x0, y0, x1 - x0, y1 - y0))
+        val out = ArrayList<Cand>()
+        for (z in doubleArrayOf(1.0, 1.75)) {
+            val pe = PROC_SCALE / z
+            val small = Mat()
+            Imgproc.resize(roi, small, Size(), pe, pe, Imgproc.INTER_AREA)
+            val base = small.cols() / REF_W * z
+            val pm = plusResponse(small, base)
+            val pw = pm.cols()
+            val ph = pm.rows()
+            val pmA = FloatArray(pw * ph)
+            pm.get(0, 0, pmA)
 
-        val roi = Mat(bgr, Rect(x0, y0, x1 - x0, y1 - y0))
-        val small = Mat()
-        val pe = PROC_SCALE / z                      // skala proses efektif
-        Imgproc.resize(roi, small, Size(), pe, pe, Imgproc.INTER_AREA)
-        val base = small.cols() / REF_W * z          // skala templat terhadap gambar proses
-
-        val pm = plusResponse(small, base)
-        val pw = pm.cols()
-        val ph = pm.rows()
-        val pmArr = FloatArray(pw * ph)
-        pm.get(0, 0, pmArr)
-
-        val gray = Mat()
-        Imgproc.cvtColor(small, gray, Imgproc.COLOR_BGR2GRAY)
-        Imgproc.medianBlur(gray, gray, 3)
-
-        val cands = ArrayList<Cand>()
-        val circles = Mat()
-        Imgproc.HoughCircles(
-            gray, circles, Imgproc.HOUGH_GRADIENT, 1.2, 26 * base, 80.0, HOUGH_P2,
-            (17 * base).toInt(), (34 * base).toInt(),
-        )
-        val w = rnd(8 * base)
-        for (i in 0 until circles.cols()) {
-            val c = circles.get(0, i) ?: continue
-            val cx = Math.rint(c[0]).toInt()
-            val cy = Math.rint(c[1]).toInt()
-            val rr = Math.rint(c[2]).toInt()
-            var best = -Float.MAX_VALUE
-            for (yy in max(0, cy - w)..min(ph - 1, cy + w)) for (xx in max(0, cx - w)..min(pw - 1, cx + w)) {
-                best = max(best, pmArr[yy * pw + xx])
+            val cands = ArrayList<Cand>()   // koordinat gambar proses
+            val gray = Mat()
+            Imgproc.cvtColor(small, gray, Imgproc.COLOR_BGR2GRAY)
+            Imgproc.medianBlur(gray, gray, 3)
+            val circ = Mat()
+            Imgproc.HoughCircles(
+                gray, circ, Imgproc.HOUGH_GRADIENT, 1.2, 20 * base, 80.0, HOUGH_P2,
+                (15 * base).toInt(), (36 * base).toInt(),
+            )
+            val w = rnd(8 * base)
+            for (i in 0 until circ.cols()) {
+                val c = circ.get(0, i) ?: continue
+                val cx = rnd(c[0]); val cy = rnd(c[1]); val rr = rnd(c[2])
+                var best = Float.NEGATIVE_INFINITY
+                for (yy in max(0, cy - w)..min(ph - 1, cy + w)) for (xx in max(0, cx - w)..min(pw - 1, cx + w)) {
+                    val v = pmA[yy * pw + xx]
+                    if (v > best) best = v
+                }
+                if (best > Float.NEGATIVE_INFINITY) cands.add(Cand(best.toDouble(), cx, cy, rr))
             }
-            if (best > -Float.MAX_VALUE) cands.add(Cand(1, best.toDouble(), cx, cy, rr))
+            val ksz = rnd(21 * base) or 1
+            val dil = Mat()
+            Imgproc.dilate(pm, dil, Mat.ones(ksz, ksz, CvType.CV_8U))
+            val dA = FloatArray(pw * ph)
+            dil.get(0, 0, dA)
+            for (yy in 0 until ph) for (xx in 0 until pw) {
+                val v = pmA[yy * pw + xx]
+                if (v >= minScore && v == dA[yy * pw + xx]) cands.add(Cand(v.toDouble(), xx, yy, rnd(24 * base)))
+            }
+            for (c in cands) {
+                if (c.score < minScore) continue
+                val X = (c.x / pe).toInt() + x0
+                val Y = (c.y / pe).toInt() + y0
+                val R = max(8, (c.r / pe).toInt())
+                if (EXCLUDE.any { e -> e[0] * W <= X && X <= e[2] * W && e[1] * H <= Y && Y <= e[3] * H }) continue
+                out.add(Cand(c.score, X, Y, R))
+            }
+            small.release(); pm.release(); gray.release(); circ.release(); dil.release()
         }
-
-        // puncak respons '+' yang tidak tertangkap Hough
-        val ksz = rnd(27 * base) or 1
-        val dil = Mat()
-        Imgproc.dilate(pm, dil, Mat.ones(ksz, ksz, CvType.CV_8U))
-        val dilArr = FloatArray(pw * ph)
-        dil.get(0, 0, dilArr)
-        val peakThr = max(minScore + 2, 8.5)
-        for (py in 0 until ph) for (px in 0 until pw) {
-            val v = pmArr[py * pw + px]
-            if (v == dilArr[py * pw + px] && v >= peakThr) cands.add(Cand(0, v.toDouble(), px, py, rnd(24 * base)))
-        }
-
-        cands.sortWith(
-            compareByDescending<Cand> { it.fromHough }.thenByDescending { it.score }
-                .thenByDescending { it.cx }.thenByDescending { it.cy }.thenByDescending { it.r },
-        )
+        roi.release()
+        out.sortWith(compareByDescending<Cand> { it.score }.thenByDescending { it.x }.thenByDescending { it.y }.thenByDescending { it.r })
         val kept = ArrayList<Cand>()
-        val minD = 28 * base
-        for (c in cands) {
-            if (c.score < minScore) continue
-            if (kept.all { sq(c.cx - it.cx) + sq(c.cy - it.cy) > minD * minD }) kept.add(c)
+        for (c in out) {
+            if (kept.all { k -> val lim = 0.45 * min(c.r, k.r); sq(c.x - k.x) + sq(c.y - k.y) > lim * lim }) kept.add(c)
         }
-
-        val out = ArrayList<Screw>()
-        for (c in kept) {
-            val cx = (c.cx / pe).toInt() + x0
-            val cy = (c.cy / pe).toInt() + y0
-            val r = max(8, (c.r / pe).toInt())
-            if (EXCLUDE.any { cx >= it[0] * W && cx <= it[2] * W && cy >= it[1] * H && cy <= it[3] * H }) continue
-            if (extraExclude.any { cx >= it[0] && cx <= it[2] && cy >= it[1] && cy <= it[3] }) continue
-            val (color, fx, fy) = bodyColor(hsv, cx, cy, r)
-            val rg = ring(hsv, fx, fy, r)
-            var mh = 0; var ms = 0; var mv = 0
-            if (rg.size >= 16) {
-                val hh = DoubleArray(rg.size) { val h = rg[it][0].toDouble(); if (h >= 165) h - 180 else h }
-                var ch = median(hh) % 180
-                if (ch < 0) ch += 180
-                val cs = median(DoubleArray(rg.size) { rg[it][1].toDouble() })
-                val cv = median(DoubleArray(rg.size) { rg[it][2].toDouble() })
-                mh = ch.toInt(); ms = cs.toInt(); mv = cv.toInt()
-                if (c.score < CAMO_SCORE && surroundSimilar(hsv, fx, fy, r, ch, cs, cv)) continue
-            }
-            if (color in Colors.SCREW) out.add(Screw(fx, fy, c.score, color, r, mh, ms, mv))
-        }
-        small.release(); roi.release(); pm.release(); gray.release(); circles.release(); dil.release()
-
-        // buang duplikat yang muncul setelah pusat digeser (skor tertinggi menang)
-        val fullBase = W / REF_W * z
-        val finalList = ArrayList<Screw>()
-        for (s in out.sortedByDescending { it.score }) {
-            if (finalList.all { sq(s.x - it.x) + sq(s.y - it.y) > (28 * fullBase) * (28 * fullBase) }) finalList.add(s)
-        }
-        return finalList
+        return kept
     }
 
     private fun sq(v: Int): Double = v.toDouble() * v
 
-    /** Apakah area di sekitar (x,y) berubah antara dua gambar? Dipakai untuk membuang ketukan sia-sia. */
-    fun regionChanged(before: Mat, after: Mat, x: Int, y: Int, r: Int = 45, thr: Double = 6.0): Boolean {
-        val xa = max(0, x - r)
-        val ya = max(0, y - r)
-        val xb = min(min(before.cols(), after.cols()), x + r)
-        val yb = min(min(before.rows(), after.rows()), y + r)
-        if (xb <= xa || yb <= ya) return true
-        val a = Mat(before, Rect(xa, ya, xb - xa, yb - ya))
-        val b = Mat(after, Rect(xa, ya, xb - xa, yb - ya))
-        val d = Mat()
-        Core.absdiff(a, b, d)
-        val m = Core.mean(d)
-        d.release()
-        return (m.`val`[0] + m.`val`[1] + m.`val`[2]) / 3.0 > thr
+    /** Potongan BGR S x S berpusat (x, y), sisi 2 * CROP_K * r, area di luar layar diisi hitam. */
+    private fun crop(bgr: Mat, x: Int, y: Int, r: Int): ByteArray {
+        val W = bgr.cols(); val H = bgr.rows()
+        val h = max(4, ScrewML.rnd(r * ScrewML.CROP_K))
+        val x0 = x - h; val y0 = y - h
+        val c = Mat.zeros(2 * h, 2 * h, CvType.CV_8UC3)
+        val xa = max(0, x0); val ya = max(0, y0); val xb = min(W, x0 + 2 * h); val yb = min(H, y0 + 2 * h)
+        if (xb > xa && yb > ya) {
+            val src = bgr.submat(Rect(xa, ya, xb - xa, yb - ya))
+            val dst = c.submat(Rect(xa - x0, ya - y0, xb - xa, yb - ya))
+            src.copyTo(dst)
+            src.release(); dst.release()
+        }
+        val s = Mat()
+        Imgproc.resize(c, s, Size(ScrewML.S.toDouble(), ScrewML.S.toDouble()), 0.0, 0.0, Imgproc.INTER_AREA)
+        val out = ByteArray(ScrewML.S * ScrewML.S * 3)
+        s.get(0, 0, out)
+        c.release(); s.release()
+        return out
+    }
+
+    /** Baut terdeteksi (peluang >= MIN_P), urut peluang menurun. extraExclude: kotak piksel [x0, y0, x1, y1]. */
+    fun detect(bgr: Mat, hsv: HsvImage, extraExclude: List<IntArray>, minP: Double = ScrewML.MIN_P): List<Screw> {
+        val dets = ArrayList<Screw>()
+        for (c in rawCands(bgr)) {
+            if (extraExclude.any { e -> e[0] <= c.x && c.x <= e[2] && e[1] <= c.y && c.y <= e[3] }) continue
+            val hc = ScrewML.headColor(hsv, c.x, c.y, c.r)
+            val p = ScrewML.prob(ScrewML.features(crop(bgr, c.x, c.y, c.r), c.score, hc.conf))
+            if (p >= minP) dets.add(Screw(c.x, c.y, p, hc.name ?: "?", c.r, hc.h, hc.s, hc.v, hc.conf))
+        }
+        // utamakan deteksi yang yakin baut DAN yakin warnanya
+        dets.sortWith(compareByDescending<Screw> { it.score * (0.5 + 0.5 * it.conf) }.thenBy { it.x }.thenBy { it.y })
+        val keep = ArrayList<Screw>()
+        for (d in dets) {
+            // deteksi ganda di satu baut (termasuk di tepinya) digabung
+            if (keep.all { k -> val lim = 0.95 * min(max(d.r, k.r).toDouble(), 1.6 * min(d.r, k.r)); sq(d.x - k.x) + sq(d.y - k.y) > lim * lim }) keep.add(d)
+        }
+        return keep
     }
 }

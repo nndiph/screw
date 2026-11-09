@@ -62,7 +62,13 @@ class DebugView(ctx: Context) : View(ctx) {
         "biru" -> Color.rgb(0, 140, 255)
         "ungu" -> Color.rgb(190, 0, 255)
         "coklat" -> Color.rgb(160, 90, 40)
-        else -> Color.GRAY
+        "khaki" -> Color.rgb(140, 130, 80)
+        "hijau" -> Color.rgb(0, 200, 60)
+        "toska" -> Color.rgb(0, 220, 230)
+        "lavender" -> Color.rgb(150, 150, 255)
+        "pink" -> Color.rgb(255, 80, 200)
+        "putih" -> Color.WHITE
+        else -> Color.DKGRAY
     }
 
     override fun onDraw(canvas: Canvas) {
@@ -125,10 +131,10 @@ class BotService : Service() {
     private var rotIndex = 0
     private var fullWaits = 0
     private val bad = ArrayList<Screw>()                // contoh baut yang ternyata masuk penyangga (salah baca warna)
-    private var lastTap: List<Screw> = emptyList()      // ketukan terakhir yang hasilnya belum diperiksa
-    private var lastTapFill = false
-    private var prevFree = -1
-    private var prevBoxSum = 0
+    private var lastTap: List<Screw> = emptyList()      // kelompok ketukan terakhir
+    private var lastFillTime = 0L                       // kapan terakhir sengaja mengisi penyangga
+    private var lastFree = -1                           // sisa lubang penyangga pada pindaian sebelumnya
+    private var lastBoxColors: List<String> = emptyList()
     private var cautious = 0                            // >0: ketuk satu-satu agar penyebab salah masuk jelas
     private var unexpected = 0                          // jumlah baut yang salah masuk penyangga
 
@@ -447,8 +453,9 @@ class BotService : Service() {
         lastPicks = emptyList()
         bad.clear()
         lastTap = emptyList()
-        lastTapFill = false
-        prevFree = -1
+        lastFillTime = 0L
+        lastFree = -1
+        lastBoxColors = emptyList()
         cautious = 0
         unexpected = 0
     }
@@ -543,26 +550,33 @@ class BotService : Service() {
             }
             val boxes = Hud.readBoxes(hsv)
             val free = Hud.freeHoles(hsv)
-            val boxSum = boxes.sumOf { it.free }
-            if (lastTap.isNotEmpty() && prevFree >= 0 && !lastTapFill) {
-                val drop = prevFree - free
-                if (drop > 0) {
-                    // ada baut masuk penyangga padahal seharusnya ke kotak: warnanya salah baca
-                    unexpected += drop
+            val now0 = System.currentTimeMillis()
+            if (lastFree >= 0 && free < lastFree) {
+                // penyangga bertambah isi padahal tidak sengaja diisi: ada ketukan yang warnanya salah baca
+                if (now0 - lastFillTime > 2500) {
+                    unexpected += lastFree - free
                     if (lastTap.size == 1) bad.add(lastTap[0]) else cautious = 8
-                } else if (cautious > 0 && prevBoxSum - boxSum > 0) {
-                    cautious--
                 }
+            } else if (cautious > 0 && lastFree >= 0 && lastTap.isNotEmpty()) {
+                cautious--
             }
-            lastTap = emptyList()
-            if (unexpected >= 3) {
-                stopBot("Berhenti: $unexpected baut salah masuk penyangga (warna salah baca). Cek warna kotak.")
+            lastFree = free
+            if (unexpected >= 3 || (!c.fill && free <= 1)) {
+                stopBot("Berhenti demi aman: penyangga terisi $unexpected baut tak terduga (sisa $free). Kirim screenshot ke pengembang.")
+                return
+            }
+            // kotak baru sedang muncul (animasi): tunggu sampai warna kotak sama di dua pindaian berturut-turut
+            val colors = boxes.map { it.color }
+            if (colors != lastBoxColors) {
+                lastBoxColors = colors
+                status("Kotak berubah: ${colors.joinToString("/")}, menunggu stabil")
+                Thread.sleep(350)
                 return
             }
             val screws = ScrewDetector.detect(bgr, hsv, extraExclude()).filter { !Strategy.looksBad(it, bad) }
             updateFails(screws)
             val now = System.currentTimeMillis()
-            pending.removeAll { now - it.first > 900 }
+            pending.removeAll { now - it.first > 1500 }
             val pend = pending.groupingBy { it.second }.eachCount()
             val (picks, why) = Strategy.chooseTargets(
                 screws, boxes, free, c.reserve, if (cautious > 0) 1 else c.batch, blacklist, 60, pend,
@@ -597,9 +611,7 @@ class BotService : Service() {
             noMatchRot = 0
             lastPicks = picks
             lastTap = picks
-            lastTapFill = why == "isi penyangga"
-            prevFree = free
-            prevBoxSum = boxSum
+            if (why == "isi penyangga") lastFillTime = System.currentTimeMillis()
             val t = System.currentTimeMillis()
             for (s in picks) pending.add(Pair(t, s.color))
             click.tapMany(picks.map { Pair(it.x, it.y) })
